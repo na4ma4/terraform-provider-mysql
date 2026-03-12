@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1020,16 +1021,71 @@ func createNewConnection(ctx context.Context, conf *MySQLConfiguration) (*OneCon
 	if retryError != nil {
 		return nil, fmt.Errorf("could not connect to server: %s", retryError)
 	}
-	db.SetConnMaxLifetime(conf.MaxConnLifetime)
-
-	// We used to set conf.MaxOpenConns, but then some connections are open outside our control
-	// and without our settings like no ANSI_QUOTES.
-	// TODO: find a way to support more open connections while able to set custom settings for each of them.
-	db.SetMaxOpenConns(1)
 
 	currentVersion, err := afterConnectVersion(ctx, conf, db)
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed running after connect command: %v", err)
+	}
+
+	// Close the temporary connection - we'll create a proper pooled one
+	db.Close()
+
+	// Create the base connector using the mysql driver's DriverContext interface
+	// This allows us to create a connector that we can wrap with session initialization
+	var baseConnector driver.Connector
+
+	mysqlDrv, ok := interface{}(&mysql.MySQLDriver{}).(driver.DriverContext)
+	if driverName == "mysql" && ok {
+		baseConnector, err = mysqlDrv.OpenConnector(conf.Config.FormatDSN())
+		if err != nil {
+			// If we can't create a custom connector, fall back to standard sql.Open
+			// with limited pooling (the old behavior)
+			db, err = sql.Open(driverName, conf.Config.FormatDSN())
+			if err != nil {
+				return nil, fmt.Errorf("could not open database: %v", err)
+			}
+			db.SetConnMaxLifetime(conf.MaxConnLifetime)
+			db.SetMaxOpenConns(1)
+			return &OneConnection{
+				Db:      db,
+				Version: currentVersion,
+			}, nil
+		}
+	} else {
+		// For cloudsql or if mysql driver doesn't implement DriverContext,
+		// use standard sql.Open with limited pooling
+		db, err = sql.Open(driverName, conf.Config.FormatDSN())
+		if err != nil {
+			return nil, fmt.Errorf("could not open database: %v", err)
+		}
+		db.SetConnMaxLifetime(conf.MaxConnLifetime)
+		if conf.MaxOpenConns > 0 {
+			db.SetMaxOpenConns(conf.MaxOpenConns)
+		}
+		return &OneConnection{
+			Db:      db,
+			Version: currentVersion,
+		}, nil
+	}
+
+	// Wrap the connector with session initialization
+	sessionConnector := &sessionInitializingConnector{
+		base: baseConnector,
+	}
+	sessionConnector.setVersion(currentVersion)
+
+	// Open the database with our custom connector
+	db = sql.OpenDB(sessionConnector)
+	db.SetConnMaxLifetime(conf.MaxConnLifetime)
+
+	// Enable connection pooling with configured max connections
+	// The sessionInitializingConnector ensures each pooled connection has proper session settings
+	if conf.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(conf.MaxOpenConns)
+	} else {
+		// Default to a reasonable pool size if not configured
+		db.SetMaxOpenConns(10)
 	}
 
 	return &OneConnection{
