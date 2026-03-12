@@ -1017,7 +1017,9 @@ func createNewConnection(ctx context.Context, conf *MySQLConfiguration) (*OneCon
 				return nil, fmt.Errorf("could not open database: %v", err)
 			}
 			db.SetConnMaxLifetime(conf.MaxConnLifetime)
+			db.SetConnMaxIdleTime(time.Minute)
 			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
 			return &OneConnection{
 				Db:      db,
 				Version: currentVersion,
@@ -1033,6 +1035,7 @@ func createNewConnection(ctx context.Context, conf *MySQLConfiguration) (*OneCon
 		db.SetConnMaxLifetime(conf.MaxConnLifetime)
 		if conf.MaxOpenConns > 0 {
 			db.SetMaxOpenConns(conf.MaxOpenConns)
+			db.SetMaxIdleConns(conf.MaxOpenConns)
 		}
 		return &OneConnection{
 			Db:      db,
@@ -1054,9 +1057,13 @@ func createNewConnection(ctx context.Context, conf *MySQLConfiguration) (*OneCon
 	// The sessionInitializingConnector ensures each pooled connection has proper session settings
 	if conf.MaxOpenConns > 0 {
 		db.SetMaxOpenConns(conf.MaxOpenConns)
+		// SetMaxIdleConns equal to MaxOpenConns to prevent connections from being closed
+		// and reopened frequently, which can cause blocking under high parallelism
+		db.SetMaxIdleConns(conf.MaxOpenConns)
 	} else {
 		// Default to a reasonable pool size if not configured
 		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(10)
 	}
 
 	return &OneConnection{
